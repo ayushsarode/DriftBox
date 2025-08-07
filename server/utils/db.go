@@ -19,7 +19,6 @@ func InitDB() error {
 		return Err("MONGO_URI not set")
 	}
 
-	// Configure client options for MongoDB Atlas
 	clientOptions := options.Client().ApplyURI(uri).
 		SetServerSelectionTimeout(30 * time.Second).
 		SetConnectTimeout(10 * time.Second).
@@ -39,7 +38,6 @@ func InitDB() error {
 		return err
 	}
 
-	// Test the connection
 	err = Client.Ping(ctx, nil)
 	if err != nil {
 		log.Printf("Failed to ping MongoDB: %v", err)

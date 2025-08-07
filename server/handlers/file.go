@@ -4,6 +4,7 @@ import (
 	"crypto/md5"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"path/filepath"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 const (
@@ -20,9 +22,7 @@ const (
 	MaxStorageSize = 2 * 1024 * 1024 * 1024 // 2GB in bytes
 )
 
-// UploadFile handles file upload to Google Cloud Storage
 func UploadFile(c *gin.Context) {
-	// Get user ID from middleware
 	userIDInterface, exists := c.Get("userID")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
@@ -36,21 +36,18 @@ func UploadFile(c *gin.Context) {
 		return
 	}
 
-	// Check user's current storage usage
 	storage, err := getUserStorage(c, userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not check storage usage"})
 		return
 	}
 
-	// Parse multipart form
 	err = c.Request.ParseMultipartForm(MaxFileSize)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "File too large or invalid form data"})
 		return
 	}
 
-	// Get file from form
 	file, fileHeader, err := c.Request.FormFile("file")
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No file provided"})
@@ -58,13 +55,11 @@ func UploadFile(c *gin.Context) {
 	}
 	defer file.Close()
 
-	// Check file size
 	if fileHeader.Size > MaxFileSize {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "File size exceeds 50MB limit"})
 		return
 	}
 
-	// Check if upload would exceed storage limit
 	if storage.UsedSpace+fileHeader.Size > MaxStorageSize {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":         "Upload would exceed 2GB storage limit",
@@ -74,7 +69,6 @@ func UploadFile(c *gin.Context) {
 		return
 	}
 
-	// Get folder ID if provided
 	folderIDStr := c.PostForm("folder_id")
 	var folderID *primitive.ObjectID
 	if folderIDStr != "" {
@@ -84,7 +78,6 @@ func UploadFile(c *gin.Context) {
 			return
 		}
 
-		// Verify folder exists and belongs to user
 		folderCollection := utils.GetCollection("folders")
 		var folder models.Folder
 		err = folderCollection.FindOne(c, bson.M{
@@ -99,13 +92,11 @@ func UploadFile(c *gin.Context) {
 		folderID = &folderObjID
 	}
 
-	// Generate unique filename for GCS
 	fileID := primitive.NewObjectID()
 	ext := filepath.Ext(fileHeader.Filename)
 	gcsFileName := fmt.Sprintf("users/%s/files/%s%s", userIDString, fileID.Hex(), ext)
 
-	// Calculate file hash for deduplication
-	file.Seek(0, 0) // Reset file pointer
+	file.Seek(0, 0)
 	hash := md5.New()
 	_, err = io.Copy(hash, file)
 	if err != nil {
@@ -114,7 +105,6 @@ func UploadFile(c *gin.Context) {
 	}
 	fileHash := fmt.Sprintf("%x", hash.Sum(nil))
 
-	// Check if file already exists (deduplication)
 	fileCollection := utils.GetCollection("files")
 	var existingFile models.File
 	err = fileCollection.FindOne(c, bson.M{
@@ -130,15 +120,13 @@ func UploadFile(c *gin.Context) {
 		return
 	}
 
-	// Upload file to Google Cloud Storage
-	file.Seek(0, 0) // Reset file pointer
+	file.Seek(0, 0)
 	gcsURL, err := utils.UploadToGCS(c, gcsFileName, file, fileHeader.Header.Get("Content-Type"))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Could not upload file to storage: %v", err)})
 		return
 	}
 
-	// Create file record in database
 	fileRecord := models.File{
 		ID:           fileID,
 		Name:         fileHeader.Filename,
@@ -147,16 +135,16 @@ func UploadFile(c *gin.Context) {
 		ContentType:  fileHeader.Header.Get("Content-Type"),
 		UserID:       userID,
 		FolderID:     folderID,
-		Path:         gcsFileName, // Store GCS path instead of local path
+		Path:         gcsFileName,
 		URL:          gcsURL,
 		Hash:         fileHash,
+		IsFavorite:   false,
 		CreatedAt:    time.Now(),
 		UpdatedAt:    time.Now(),
 	}
 
 	_, err = fileCollection.InsertOne(c, fileRecord)
 	if err != nil {
-		// Clean up GCS file if database insert fails
 		utils.DeleteFromGCS(c, gcsFileName)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not save file record"})
 		return
@@ -188,7 +176,11 @@ func GetFiles(c *gin.Context) {
 		}
 		filter["folder_id"] = folderObjID
 	} else {
-		filter["folder_id"] = bson.M{"$exists": false}
+		// For root folder, get files where folder_id is null or doesn't exist
+		filter["$or"] = []bson.M{
+			{"folder_id": bson.M{"$exists": false}},
+			{"folder_id": nil},
+		}
 	}
 
 	collection := utils.GetCollection("files")
@@ -208,7 +200,7 @@ func GetFiles(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"files": files})
 }
 
-// DownloadFile handles file download using GCS signed URLs
+// DownloadFile handles file download using proxy method by default, with signed URL fallback
 func DownloadFile(c *gin.Context) {
 	fileID := c.Param("id")
 	fileObjID, err := primitive.ObjectIDFromHex(fileID)
@@ -234,21 +226,47 @@ func DownloadFile(c *gin.Context) {
 		return
 	}
 
-	// Generate signed URL for download (valid for 1 hour)
-	signedURL, err := utils.GenerateSignedURL(c, file.Path, time.Hour)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not generate download URL"})
-		return
-	}
-
-	// Redirect to signed URL or return the URL
+	// Check if signed URL is explicitly requested
 	if c.Query("redirect") == "true" {
-		c.Redirect(http.StatusFound, signedURL)
-	} else {
+		// Try to generate signed URL for redirect
+		signedURL, err := utils.GenerateSignedURL(c, file.Path, time.Hour)
+		if err != nil {
+			// If signed URL generation fails, fall back to proxy download
+			c.JSON(http.StatusOK, gin.H{
+				"download_url": fmt.Sprintf("/api/files/%s/download", fileID),
+				"expires_in":   "session",
+				"method":       "proxy",
+				"note":         "Signed URL failed, use direct download",
+			})
+			return
+		}
+
 		c.JSON(http.StatusOK, gin.H{
 			"download_url": signedURL,
 			"expires_in":   "1 hour",
+			"method":       "signed_url",
 		})
+		return
+	}
+
+	// Default behavior: Direct proxy download through our server
+	reader, err := utils.DownloadFromGCS(c, file.Path)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not download file"})
+		return
+	}
+	defer reader.Close()
+
+	// Set appropriate headers for file download
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", file.OriginalName))
+	c.Header("Content-Type", file.ContentType)
+	c.Header("Content-Length", fmt.Sprintf("%d", file.Size))
+
+	// Stream the file directly to the client
+	_, err = io.Copy(c.Writer, reader)
+	if err != nil {
+		// Log error but don't send JSON response as headers are already sent
+		fmt.Printf("Error streaming file: %v\n", err)
 	}
 }
 
@@ -304,20 +322,51 @@ func DeleteFile(c *gin.Context) {
 
 // GetStorageInfo returns user's storage usage information
 func GetStorageInfo(c *gin.Context) {
-	userIDInterface, _ := c.Get("userID")
+	userIDInterface, exists := c.Get("userID")
+	if !exists {
+		log.Printf("ERROR: userID not found in context")
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found"})
+		return
+	}
+
 	userIDString := userIDInterface.(string)
-	userID, _ := primitive.ObjectIDFromHex(userIDString)
+	log.Printf("GetStorageInfo called for user: %s", userIDString)
+
+	userID, err := primitive.ObjectIDFromHex(userIDString)
+	if err != nil {
+		log.Printf("ERROR: Invalid user ID format: %s", userIDString)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+		return
+	}
+
+	// Recalculate storage from actual files and folders
+	err = recalculateUserStorage(c, userID)
+	if err != nil {
+		log.Printf("Warning: Could not recalculate storage: %v", err)
+	}
 
 	storage, err := getUserStorage(c, userID)
 	if err != nil {
+		log.Printf("ERROR: Could not get storage for user %s: %v", userIDString, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not retrieve storage info"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	log.Printf("Storage info for user %s: %+v", userIDString, storage)
+
+	// Calculate usage percentage safely
+	var usagePercentage float64 = 0
+	if storage.MaxSpace > 0 {
+		usagePercentage = float64(storage.UsedSpace) / float64(storage.MaxSpace) * 100
+	}
+
+	response := gin.H{
 		"storage":          storage,
-		"usage_percentage": float64(storage.UsedSpace) / float64(storage.MaxSpace) * 100,
-	})
+		"usage_percentage": usagePercentage,
+	}
+
+	log.Printf("Sending storage response: %+v", response)
+	c.JSON(http.StatusOK, response)
 }
 
 // Helper function to get user storage information
@@ -325,8 +374,10 @@ func getUserStorage(c *gin.Context, userID primitive.ObjectID) (*models.UserStor
 	collection := utils.GetCollection("user_storage")
 	var storage models.UserStorage
 
+	log.Printf("Looking up storage for user: %s", userID.Hex())
 	err := collection.FindOne(c, bson.M{"user_id": userID}).Decode(&storage)
 	if err != nil {
+		log.Printf("Storage record not found for user %s, creating new one: %v", userID.Hex(), err)
 		// Create default storage record if it doesn't exist
 		storage = models.UserStorage{
 			UserID:      userID,
@@ -336,8 +387,184 @@ func getUserStorage(c *gin.Context, userID primitive.ObjectID) (*models.UserStor
 			FolderCount: 0,
 			UpdatedAt:   time.Now(),
 		}
-		collection.InsertOne(c, storage)
+
+		result, insertErr := collection.InsertOne(c, storage)
+		if insertErr != nil {
+			log.Printf("Failed to create storage record for user %s: %v", userID.Hex(), insertErr)
+			return nil, insertErr
+		}
+		log.Printf("Created new storage record for user %s: %v", userID.Hex(), result.InsertedID)
+	} else {
+		log.Printf("Found existing storage record for user %s: %+v", userID.Hex(), storage)
+		log.Printf("Storage values - UsedSpace: %d, MaxSpace: %d", storage.UsedSpace, storage.MaxSpace)
+
+		// Fix any storage records with invalid MaxSpace
+		if storage.MaxSpace <= 0 {
+			log.Printf("Fixing invalid MaxSpace for user %s", userID.Hex())
+			storage.MaxSpace = MaxStorageSize
+			collection.UpdateOne(c, bson.M{"user_id": userID}, bson.M{
+				"$set": bson.M{"max_space": MaxStorageSize, "updated_at": time.Now()},
+			})
+		}
 	}
 
 	return &storage, nil
+}
+
+// recalculateUserStorage recalculates storage from actual files and folders
+func recalculateUserStorage(c *gin.Context, userID primitive.ObjectID) error {
+	// Calculate total file size
+	fileCollection := utils.GetCollection("files")
+	pipeline := []bson.M{
+		{"$match": bson.M{"user_id": userID}},
+		{"$group": bson.M{
+			"_id":       nil,
+			"totalSize": bson.M{"$sum": "$size"},
+			"fileCount": bson.M{"$sum": 1},
+		}},
+	}
+
+	cursor, err := fileCollection.Aggregate(c, pipeline)
+	if err != nil {
+		return fmt.Errorf("could not aggregate file sizes: %v", err)
+	}
+	defer cursor.Close(c)
+
+	var result struct {
+		TotalSize int64 `bson:"totalSize"`
+		FileCount int   `bson:"fileCount"`
+	}
+
+	if cursor.Next(c) {
+		if err := cursor.Decode(&result); err != nil {
+			return fmt.Errorf("could not decode aggregation result: %v", err)
+		}
+	}
+
+	// Count folders
+	folderCollection := utils.GetCollection("folders")
+	folderCount, err := folderCollection.CountDocuments(c, bson.M{"user_id": userID})
+	if err != nil {
+		return fmt.Errorf("could not count folders: %v", err)
+	}
+
+	// Update storage record
+	storageCollection := utils.GetCollection("user_storage")
+	_, err = storageCollection.UpdateOne(
+		c,
+		bson.M{"user_id": userID},
+		bson.M{
+			"$set": bson.M{
+				"used_space":   result.TotalSize,
+				"file_count":   result.FileCount,
+				"folder_count": int(folderCount),
+				"updated_at":   time.Now(),
+			},
+		},
+		options.Update().SetUpsert(true),
+	)
+
+	if err != nil {
+		return fmt.Errorf("could not update storage record: %v", err)
+	}
+
+	fmt.Printf("DEBUG: Recalculated storage for user %s - Size: %d bytes, Files: %d, Folders: %d\n",
+		userID.Hex(), result.TotalSize, result.FileCount, int(folderCount))
+
+	return nil
+}
+
+// ToggleFavorite toggles the favorite status of a file
+func ToggleFavorite(c *gin.Context) {
+	fileID := c.Param("id")
+	fmt.Printf("ToggleFavorite called with fileID: %s\n", fileID)
+
+	fileObjID, err := primitive.ObjectIDFromHex(fileID)
+	if err != nil {
+		fmt.Printf("Invalid file ID error: %v\n", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid file ID"})
+		return
+	}
+
+	userIDInterface, exists := c.Get("userID")
+	if !exists {
+		fmt.Printf("User ID not found in context\n")
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+
+	userIDString := userIDInterface.(string)
+	userID, err := primitive.ObjectIDFromHex(userIDString)
+	if err != nil {
+		fmt.Printf("Invalid user ID error: %v\n", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+		return
+	}
+
+	// Find file record
+	collection := utils.GetCollection("files")
+	var file models.File
+	err = collection.FindOne(c, bson.M{
+		"_id":     fileObjID,
+		"user_id": userID,
+	}).Decode(&file)
+
+	if err != nil {
+		fmt.Printf("File not found error: %v\n", err)
+		c.JSON(http.StatusNotFound, gin.H{"error": "File not found"})
+		return
+	}
+
+	fmt.Printf("Current favorite status: %v\n", file.IsFavorite)
+
+	// Toggle favorite status
+	newFavoriteStatus := !file.IsFavorite
+	updateResult, err := collection.UpdateOne(c, bson.M{
+		"_id":     fileObjID,
+		"user_id": userID,
+	}, bson.M{
+		"$set": bson.M{
+			"is_favorite": newFavoriteStatus,
+			"updated_at":  time.Now(),
+		},
+	})
+
+	if err != nil {
+		fmt.Printf("Update error: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Could not update file: %v", err)})
+		return
+	}
+
+	fmt.Printf("Update result - matched: %d, modified: %d\n", updateResult.MatchedCount, updateResult.ModifiedCount)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":     "File favorite status updated",
+		"is_favorite": newFavoriteStatus,
+	})
+}
+
+// GetFavoriteFiles retrieves all favorite files for the authenticated user
+func GetFavoriteFiles(c *gin.Context) {
+	userIDInterface, _ := c.Get("userID")
+	userIDString := userIDInterface.(string)
+	userID, _ := primitive.ObjectIDFromHex(userIDString)
+
+	collection := utils.GetCollection("files")
+	cursor, err := collection.Find(c, bson.M{
+		"user_id":     userID,
+		"is_favorite": true,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not retrieve favorite files"})
+		return
+	}
+	defer cursor.Close(c)
+
+	var files []models.File
+	if err = cursor.All(c, &files); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not decode favorite files"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"files": files})
 }

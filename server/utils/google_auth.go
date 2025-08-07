@@ -35,28 +35,23 @@ type GoogleUserInfo struct {
 }
 
 func GetGoogleUserInfo(token *oauth2.Token) (*GoogleUserInfo, error) {
-	// Create HTTP client with the token
 	client := GoogleOAuthConfig.Client(context.Background(), token)
 
-	// Make request to Google's userinfo endpoint
 	resp, err := client.Get("https://www.googleapis.com/oauth2/v2/userinfo")
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	// Read response body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
-	// Check for HTTP errors
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("failed to get user info: %s", string(body))
 	}
 
-	// Parse JSON response
 	var googleUser GoogleUserInfo
 	err = json.Unmarshal(body, &googleUser)
 	if err != nil {

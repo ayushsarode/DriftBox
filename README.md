@@ -9,7 +9,8 @@ DriftBox is a cloud storage API that allows users to create folders, upload file
 - File upload to Google Cloud Storage (up to 50MB per file)
 - Storage limit enforcement (2GB per user)
 - File deduplication using MD5 hashes
-- Secure file downloads using signed URLs
+- Secure file downloads with proxy streaming (no GCS permission issues)
+- Fallback signed URL support for advanced use cases
 
 ## Setup
 
@@ -143,15 +144,30 @@ GET /api/files?folder_id=optional-folder-id
 ##### Download File
 
 ```
+# Direct download (default) - streams file through API server
 GET /api/files/{file-id}/download
+
+# Signed URL download (for redirect use cases)
 GET /api/files/{file-id}/download?redirect=true
 
-Response:
+Default response: File content streamed directly
+With redirect=true response:
 {
   "download_url": "signed-gcs-url",
-  "expires_in": "1 hour"
+  "expires_in": "1 hour",
+  "method": "signed_url"
+}
+
+If signed URL fails:
+{
+  "download_url": "/api/files/{file-id}/download",
+  "expires_in": "session",
+  "method": "proxy",
+  "note": "Signed URL failed, use direct download"
 }
 ```
+
+**Note**: The default behavior now streams files directly through the API server to avoid Google Cloud Storage permission issues. This provides better security and reliability.
 
 ##### Delete File
 

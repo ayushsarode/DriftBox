@@ -8,13 +8,11 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-
-func GenerateToken(userID string) (string, error){
-	claims := jwt.MapClaims {
+func GenerateToken(userID string) (string, error) {
+	claims := jwt.MapClaims{
 		"userID": userID,
-		"exp": time.Now().Add(time.Hour * 24).Unix(),
+		"exp":    time.Now().Add(time.Hour * 24).Unix(),
 	}
-
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 
@@ -23,7 +21,6 @@ func GenerateToken(userID string) (string, error){
 
 func ValidateToken(tokenString string) (*jwt.Token, error) {
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-		// Ensure the token method is HMAC
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, errors.New("unexpected signing method")
 		}

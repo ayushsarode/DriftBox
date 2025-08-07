@@ -48,6 +48,8 @@ func main() {
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
+		log.Printf("CORS middleware: %s %s", c.Request.Method, c.Request.URL.Path)
+
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return
@@ -72,6 +74,13 @@ func main() {
 	// (require authentication)
 	protected := route.Group("/api")
 	protected.Use(middleware.Authmiddleware())
+
+	// Add debugging middleware
+	protected.Use(func(c *gin.Context) {
+		log.Printf("Protected route hit: %s %s", c.Request.Method, c.Request.URL.Path)
+		c.Next()
+	})
+
 	{
 		// Folder management
 		protected.POST("/folders", handlers.CreateFolder)
@@ -81,8 +90,18 @@ func main() {
 		// File management
 		protected.POST("/files/upload", handlers.UploadFile)
 		protected.GET("/files", handlers.GetFiles)
+		protected.GET("/files/favorites", handlers.GetFavoriteFiles)
+		protected.POST("/files/toggle-favorite/:id", handlers.ToggleFavorite)
 		protected.GET("/files/:id/download", handlers.DownloadFile)
 		protected.DELETE("/files/:id", handlers.DeleteFile)
+
+		// Test endpoint
+		protected.GET("/files/test", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"message": "test endpoint works"})
+		})
+
+		log.Println("Registered route: GET /api/files/favorites")
+		log.Println("Registered route: POST /api/files/:id/favorite")
 
 		// Storage info
 		protected.GET("/storage", handlers.GetStorageInfo)
