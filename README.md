@@ -1,4 +1,4 @@
-# DriftBox API Documentation (currently working)
+# VaultDocs API Documentation (currently working)
 
 DriftBox is a cloud storage API that allows users to create folders, upload files (up to 50MB), and manage their storage (2GB limit per user).
 
